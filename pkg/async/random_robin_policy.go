@@ -1,6 +1,7 @@
 package async
 
 import (
+	"net/url"
 	"reflect"
 
 	"github.com/llm-d-incubation/llm-d-async/api"
@@ -49,10 +50,11 @@ func (r *RandomRobinPolicy) MergeRequestChannels(channels []pipeline.RequestChan
 				if !ok || ir == nil {
 					continue
 				}
-				requestURL := meta[i1].IGWBaseURl + meta[i1].RequestPathURL
+				requestPath := meta[i1].RequestPathURL
 				if ep := ir.PublicRequest.ReqEndpoint(); ep != "" {
-					requestURL = meta[i1].IGWBaseURl + ep
+					requestPath = ep
 				}
+				requestURL, _ := url.JoinPath(meta[i1].IGWBaseURL, requestPath)
 				headers := map[string]string{
 					"Content-Type":                  "application/json",
 					"x-gateway-inference-objective": meta[i1].InferenceObjective,
