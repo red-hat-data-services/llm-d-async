@@ -28,6 +28,12 @@ const (
 	redisGateRequestQueue = "redis-gate-request-sortedset"
 	redisGateResultQueue  = "redis-gate-result-list"
 	dispatchGateBudgetKey = "dispatch-gate-budget"
+
+	endpointScrapeRequestQueue = "endpoint-scrape-request-sortedset"
+	endpointScrapeResultQueue  = "endpoint-scrape-result-list"
+
+	shortDrainRequestQueue = "short-drain-request-sortedset"
+	shortDrainResultQueue  = "short-drain-result-list"
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}

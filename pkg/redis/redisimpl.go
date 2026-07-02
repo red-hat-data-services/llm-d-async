@@ -3,7 +3,6 @@ package redis
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 	"sync"
@@ -11,7 +10,7 @@ import (
 
 	"github.com/llm-d-incubation/llm-d-async/api"
 	"github.com/llm-d-incubation/llm-d-async/pipeline"
-	"github.com/llm-d-incubation/llm-d-async/pkg/util"
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -25,19 +24,6 @@ const (
 	// maxBatchSize is the maximum number of messages flushed in a single
 	// Redis pipeline call.
 	maxBatchSize = 32
-)
-
-var (
-	igwBaseURL         = flag.String("redis.igw-base-url", "", "Base URL for IGW. Mutually exclusive with redis.queues-config-file flag.")
-	requestPathURL     = flag.String("redis.request-path-url", "/v1/completions", "request path url. Mutually exclusive with redis.queues-config-file flag.")
-	inferenceObjective = flag.String("redis.inference-objective", "", "inference objective to use in requests. Mutually exclusive with redis.queues-config-file flag.")
-	requestQueueName   = flag.String("redis.request-queue-name", "request-queue", "name of the Redis channel for request messages. Mutually exclusive with redis.queues-config-file flag.")
-
-	retryQueueName  = flag.String("redis.retry-queue-name", "retry-sortedset", "name of the Redis sorted set for retry messages")
-	resultQueueName = flag.String("redis.result-queue-name", "result-queue", "name of the Redis channel for result messages")
-
-	queuesConfig     = flag.String("redis.queues-config", "", "Inline JSON queues configuration. Takes precedence over redis.queues-config-file and single-queue flags.")
-	queuesConfigFile = flag.String("redis.queues-config-file", "", "Queues Configuration file. Mutually exclusive with redis.igw-base-url, redis.request-queue-name, redis.request-path-url and redis.inference-objective flags. See documentation about syntax")
 )
 
 const retryPopBatchSize = 100
@@ -131,41 +117,70 @@ func drainBatch[T any](first T, channel <-chan T, maxBatchSize int) []T {
 }
 
 type QueueConfig struct {
-	QueueName          string `json:"queue_name"`
-	InferenceObjective string `json:"inference_objective"`
-	RequestPathURL     string `json:"request_path_url"`
-	IGWBaseURL         string `json:"igw_base_url"`
+	QueueName          string            `json:"queue_name"`
+	WorkerPoolID       string            `json:"worker_pool_id"`
+	InferenceObjective string            `json:"inference_objective"`
+	RequestPathURL     string            `json:"request_path_url"`
+	IGWBaseURL         string            `json:"igw_base_url"`
+	Labels             map[string]string `json:"labels,omitempty"`
 }
 
 type RequestChannelData struct {
 	requestChannel pipeline.RequestChannel
 	queueName      string
+	labels         map[string]string
 }
 
-var _ pipeline.Flow = (*RedisMQFlow)(nil)
+var (
+	_ pipeline.Flow          = (*RedisMQFlow)(nil)
+	_ pipeline.HealthChecker = (*RedisMQFlow)(nil)
+)
 
 type RedisMQFlow struct {
 	rdb             *redis.Client
 	requestChannels []RequestChannelData
 	retryChannel    chan pipeline.RetryMessage
 	resultChannel   chan api.ResultMessage
+	retryQueueName  string
+	resultQueueName string
+	workerPools     []pipeline.WorkerPoolConfig
+	consumeCancel   context.CancelFunc
+	consumeWg       sync.WaitGroup
 	drainCancel     context.CancelFunc
 	drainWg         sync.WaitGroup
+	enableTracing   bool
 }
 
-func NewRedisMQFlow() (*RedisMQFlow, error) {
-	opts, err := RedisOptions()
+// RedisOption is a functional option for configuring RedisMQFlow.
+type RedisOption func(*RedisMQFlow)
+
+// WithRedisTracing enables per-command Redis tracing spans via redisotel.
+func WithRedisTracing(enable bool) RedisOption {
+	return func(r *RedisMQFlow) {
+		r.enableTracing = enable
+	}
+}
+
+// WithWorkerPools sets the pool configurations to resolve named pools.
+func WithWorkerPools(workerPools []pipeline.WorkerPoolConfig) RedisOption {
+	return func(r *RedisMQFlow) {
+		r.workerPools = workerPools
+	}
+}
+
+func NewRedisMQFlow(flowOpts PubSubFlowOptions, connOpts ConnectionOptions, fns ...RedisOption) (*RedisMQFlow, error) {
+	redisOpts, err := ParseRedisOptions(connOpts.URL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid Redis connection config: %w", err)
 	}
-	rdb := redis.NewClient(opts)
+	rdb := redis.NewClient(redisOpts)
 	var configs []QueueConfig
-	if *queuesConfig != "" {
-		if err := json.Unmarshal([]byte(*queuesConfig), &configs); err != nil {
+	if flowOpts.QueuesConfig != "" {
+		if err := json.Unmarshal([]byte(flowOpts.QueuesConfig), &configs); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal inline queues config: %w", err)
 		}
-	} else if *queuesConfigFile != "" {
-		data, err := os.ReadFile(*queuesConfigFile)
+	} else if flowOpts.QueuesConfigFile != "" {
+		data, err := os.ReadFile(flowOpts.QueuesConfigFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read queues config file: %w", err)
 		}
@@ -173,7 +188,25 @@ func NewRedisMQFlow() (*RedisMQFlow, error) {
 			return nil, fmt.Errorf("failed to unmarshal queues config: %w", err)
 		}
 	} else {
-		configs = []QueueConfig{{QueueName: *requestQueueName, IGWBaseURL: *igwBaseURL, InferenceObjective: *inferenceObjective, RequestPathURL: *requestPathURL}}
+		configs = []QueueConfig{{
+			QueueName:          flowOpts.RequestQueueName,
+			WorkerPoolID:       "default",
+			InferenceObjective: flowOpts.InferenceObjective,
+			IGWBaseURL:         flowOpts.IGWBaseURL,
+			RequestPathURL:     flowOpts.RequestPathURL,
+		}}
+	}
+
+	flow := &RedisMQFlow{
+		rdb:             rdb,
+		retryChannel:    make(chan pipeline.RetryMessage),
+		resultChannel:   make(chan api.ResultMessage, resultChannelBuffer),
+		retryQueueName:  flowOpts.RetryQueueName,
+		resultQueueName: flowOpts.ResultQueueName,
+	}
+
+	for _, fn := range fns {
+		fn(flow)
 	}
 
 	var channels []RequestChannelData
@@ -181,33 +214,81 @@ func NewRedisMQFlow() (*RedisMQFlow, error) {
 	for _, cfg := range configs {
 		ch := make(chan *api.InternalRequest)
 
-		channels = append(channels, RequestChannelData{pipeline.RequestChannel{
-			Channel:            ch,
-			InferenceObjective: cfg.InferenceObjective,
-			RequestPathURL:     util.NormalizeURLPath(cfg.RequestPathURL),
-			IGWBaseURL:         util.NormalizeBaseURL(cfg.IGWBaseURL),
-		}, cfg.QueueName})
+		workerPoolID := cfg.WorkerPoolID
+		if workerPoolID == "" {
+			workerPoolID = "default"
+		}
+
+		found := false
+		for _, pool := range flow.workerPools {
+			if pool.ID == workerPoolID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("worker pool %q specified in queue config not found in pool configuration", workerPoolID)
+		}
+
+		if cfg.IGWBaseURL == "" {
+			return nil, fmt.Errorf("queue config for queue %q: igw_base_url must be specified", cfg.QueueName)
+		}
+
+		reqPath := cfg.RequestPathURL
+		if reqPath == "" {
+			reqPath = "/v1/completions"
+		}
+
+		channels = append(channels, RequestChannelData{
+			requestChannel: pipeline.RequestChannel{
+				Channel:            ch,
+				InferenceObjective: cfg.InferenceObjective,
+				RequestPathURL:     reqPath,
+				IGWBaseURL:         cfg.IGWBaseURL,
+				WorkerPoolID:       workerPoolID,
+			},
+			queueName: cfg.QueueName,
+			labels:    cfg.Labels,
+		})
 	}
-	return &RedisMQFlow{
-		rdb:             rdb,
-		requestChannels: channels,
-		retryChannel:    make(chan pipeline.RetryMessage),
-		resultChannel:   make(chan api.ResultMessage, resultChannelBuffer),
-	}, nil
+	if flow.enableTracing {
+		if err := redisotel.InstrumentTracing(rdb); err != nil {
+			_ = rdb.Close()
+			return nil, fmt.Errorf("failed to instrument Redis tracing: %w", err)
+		}
+	}
+	flow.requestChannels = channels
+
+	return flow, nil
 }
 
 func (r *RedisMQFlow) Start(ctx context.Context) {
-	drainCtx, drainCancel := context.WithCancel(log.IntoContext(context.Background(), log.FromContext(ctx)))
+	logger := log.FromContext(ctx)
+	consumeCtx, consumeCancel := context.WithCancel(log.IntoContext(context.Background(), logger))
+	r.consumeCancel = consumeCancel
+
+	drainCtx, drainCancel := context.WithCancel(log.IntoContext(context.Background(), logger))
 	r.drainCancel = drainCancel
 
 	for _, channelData := range r.requestChannels {
-		go requestWorker(ctx, r.rdb, channelData.requestChannel.Channel, channelData.queueName)
+		r.consumeWg.Add(1)
+		go func(cd RequestChannelData) {
+			defer r.consumeWg.Done()
+			requestWorker(consumeCtx, r.rdb, cd.requestChannel.Channel, cd.queueName, cd.labels)
+		}(channelData)
 	}
 
 	r.drainWg.Add(3)
-	go func() { defer r.drainWg.Done(); addMsgToRetryWorker(drainCtx, r.rdb, r.retryChannel, *retryQueueName) }()
+	go func() { defer r.drainWg.Done(); addMsgToRetryWorker(drainCtx, r.rdb, r.retryChannel, r.retryQueueName) }()
 	go func() { defer r.drainWg.Done(); r.retryWorker(drainCtx, r.rdb) }()
-	go func() { defer r.drainWg.Done(); r.resultWorker(drainCtx, *resultQueueName) }() // #nosec G118
+	go func() { defer r.drainWg.Done(); r.resultWorker(drainCtx, r.resultQueueName) }() // #nosec G118
+}
+
+func (r *RedisMQFlow) StopConsuming() {
+	if r.consumeCancel != nil {
+		r.consumeCancel()
+	}
+	r.consumeWg.Wait()
 }
 
 func (r *RedisMQFlow) Shutdown() {
@@ -288,10 +369,10 @@ const (
 )
 
 // Automatically reconnects when the subscription channel closes.
-func requestWorker(ctx context.Context, rdb *redis.Client, msgChannel chan *api.InternalRequest, queueName string) {
+func requestWorker(ctx context.Context, rdb *redis.Client, msgChannel chan *api.InternalRequest, queueName string, labels map[string]string) {
 	logger := log.FromContext(ctx)
 	for ctx.Err() == nil {
-		shouldReconnect := consumeSubscription(ctx, rdb, msgChannel, queueName)
+		shouldReconnect := consumeSubscription(ctx, rdb, msgChannel, queueName, labels)
 		if ctx.Err() != nil {
 			return
 		}
@@ -306,7 +387,7 @@ func requestWorker(ctx context.Context, rdb *redis.Client, msgChannel chan *api.
 	}
 }
 
-func consumeSubscription(ctx context.Context, rdb *redis.Client, msgChannel chan *api.InternalRequest, queueName string) bool {
+func consumeSubscription(ctx context.Context, rdb *redis.Client, msgChannel chan *api.InternalRequest, queueName string, labels map[string]string) bool {
 	logger := log.FromContext(ctx)
 	sub := rdb.Subscribe(ctx, queueName)
 	defer sub.Close() // nolint:errcheck
@@ -330,9 +411,21 @@ func consumeSubscription(ctx context.Context, rdb *redis.Client, msgChannel chan
 				continue
 			}
 			ir.RequestQueueName = queueName
+			if len(labels) > 0 {
+				if ir.Labels == nil {
+					ir.Labels = make(map[string]string, len(labels))
+				}
+				for k, v := range labels {
+					ir.Labels[k] = v
+				}
+			}
 			msgChannel <- &ir
 		}
 	}
+}
+
+func (r *RedisMQFlow) HealthCheck(ctx context.Context) error {
+	return r.rdb.Ping(ctx).Err()
 }
 
 func (r *RedisMQFlow) Characteristics() pipeline.Characteristics {
@@ -345,30 +438,36 @@ func (r *RedisMQFlow) Characteristics() pipeline.Characteristics {
 // Puts msgs from the retry channel into a Redis sorted-set with a duration Score.
 func addMsgToRetryWorker(ctx context.Context, rdb *redis.Client, retryChannel chan pipeline.RetryMessage, sortedSetName string) {
 	logger := log.FromContext(ctx)
+	addRetry := func(msg pipeline.RetryMessage) {
+		if msg.InternalRequest == nil {
+			return
+		}
+		score := float64(time.Now().Unix()) + msg.BackoffDurationSeconds
+		bytes, err := json.Marshal(msg.InternalRequest)
+		if err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Failed to marshal message for retry in Redis")
+			return
+		}
+		if err := retryRedisOp(ctx, func(opCtx context.Context) error {
+			return rdb.ZAdd(opCtx, sortedSetName, redis.Z{Score: score, Member: string(bytes)}).Err()
+		}); err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Failed to add message for retry in Redis")
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			for {
+				select {
+				case msg := <-retryChannel:
+					addRetry(msg)
+				default:
+					return
+				}
+			}
 
 		case msg := <-retryChannel:
-			if msg.InternalRequest == nil {
-				continue
-			}
-			score := float64(time.Now().Unix()) + msg.BackoffDurationSeconds
-			bytes, err := json.Marshal(msg.InternalRequest)
-			if err != nil {
-				logger.V(logutil.DEFAULT).Error(err, "Failed to marshal message for retry in Redis")
-				continue // skip this message.
-			}
-			err = rdb.ZAdd(ctx, sortedSetName, redis.Z{
-				Score:  score,
-				Member: string(bytes),
-			}).Err()
-
-			if err != nil {
-				// skip this message. We're not going to retry a "preparing to retry" step.
-				logger.V(logutil.DEFAULT).Error(err, "Failed to add message for retry in Redis")
-			}
+			addRetry(msg)
 		}
 	}
 
@@ -401,7 +500,7 @@ func (r *RedisMQFlow) retryWorker(ctx context.Context, rdb *redis.Client) {
 			drainedAny := false
 
 			for {
-				results, err := popDueRetryMessages(ctx, rdb, *retryQueueName, currentTimeSec, retryPopBatchSize)
+				results, err := popDueRetryMessages(ctx, rdb, r.retryQueueName, currentTimeSec, retryPopBatchSize)
 				if err != nil {
 					logger.V(logutil.DEFAULT).Error(err, "Failed to atomically pop due retry messages")
 					break
@@ -466,7 +565,7 @@ func (r *RedisMQFlow) requeueRetryMessages(rdb *redis.Client, messages []string)
 	if err := retryRedisOp(context.Background(), func(ctx context.Context) error {
 		pipe := rdb.Pipeline()
 		for _, msg := range messages {
-			pipe.ZAdd(ctx, *retryQueueName, redis.Z{Score: score, Member: msg})
+			pipe.ZAdd(ctx, r.retryQueueName, redis.Z{Score: score, Member: msg})
 		}
 		_, err := pipe.Exec(ctx)
 		return err

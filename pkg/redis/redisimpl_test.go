@@ -318,15 +318,16 @@ func TestMQRetryWorker_RequeuesOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	retryQueue := *retryQueueName
+	retryQueue := "retry-sortedset"
 	queueName := "req-queue"
 
 	// Use a blocking (unbuffered) request channel so the worker blocks on send.
 	reqCh := make(chan *api.InternalRequest)
 	flow := &RedisMQFlow{
-		rdb:           rdb,
-		resultChannel: make(chan api.ResultMessage, resultChannelBuffer),
-		retryChannel:  make(chan pipeline.RetryMessage),
+		rdb:            rdb,
+		resultChannel:  make(chan api.ResultMessage, resultChannelBuffer),
+		retryChannel:   make(chan pipeline.RetryMessage),
+		retryQueueName: retryQueue,
 		requestChannels: []RequestChannelData{{
 			requestChannel: pipeline.RequestChannel{Channel: reqCh},
 			queueName:      queueName,
@@ -540,7 +541,7 @@ func TestRequestWorker_ReconnectsAfterChannelClose(t *testing.T) {
 	queueName := "reconnect-test-queue"
 	msgChannel := make(chan *api.InternalRequest, 10)
 
-	go requestWorker(ctx, rdb, msgChannel, queueName)
+	go requestWorker(ctx, rdb, msgChannel, queueName, nil)
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -737,5 +738,96 @@ func TestMQRetryWorker_ExitsPromptlyOnCancelDuringSleep(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("retryWorker did not exit within 2s of context cancellation")
+	}
+}
+
+func TestNewRedisMQFlow_PoolRequiredAndValidation(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	connOpts := ConnectionOptions{URL: "redis://" + s.Addr()}
+
+	// Case 1: worker_pool_id is missing from configuration, and pool "default" does not exist
+	opts := PubSubFlowOptions{QueuesConfig: `[{"queue_name":"test-queue","inference_objective":"obj","igw_base_url":"http://gw"}]`}
+	_, err := NewRedisMQFlow(opts, connOpts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when worker_pool_id is missing and 'default' pool does not exist, got nil")
+	}
+
+	// Case 5: worker_pool_id is missing, but only a single 'default' pool is specified
+	opts = PubSubFlowOptions{QueuesConfig: `[{"queue_name":"test-queue","inference_objective":"obj","igw_base_url":"http://gw"}]`}
+	_, err = NewRedisMQFlow(opts, connOpts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	if err != nil {
+		t.Errorf("Unexpected error when worker_pool_id is missing but default pool exists: %v", err)
+	}
+
+	// Case 6: worker_pool_id is specified as custom, but only a single 'default' pool is specified
+	opts = PubSubFlowOptions{QueuesConfig: `[{"queue_name":"test-queue","worker_pool_id":"custom-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`}
+	_, err = NewRedisMQFlow(opts, connOpts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when worker_pool_id is custom but only default pool exists, got nil")
+	}
+
+	// Case 2: worker_pool_id is specified but pool does not exist
+	opts = PubSubFlowOptions{QueuesConfig: `[{"queue_name":"test-queue","worker_pool_id":"non-existent","inference_objective":"obj","igw_base_url":"http://gw"}]`}
+	_, err = NewRedisMQFlow(opts, connOpts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when specified worker_pool_id does not exist, got nil")
+	}
+
+	// Case 3: worker_pool_id specified and pool exists, but igw_base_url is missing
+	opts = PubSubFlowOptions{QueuesConfig: `[{"queue_name":"test-queue","worker_pool_id":"test-pool","inference_objective":"obj"}]`}
+	_, err = NewRedisMQFlow(opts, connOpts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when igw_base_url is missing in queue config, got nil")
+	}
+
+	// Case 4: worker_pool_id and igw_base_url specified and pool exists
+	opts = PubSubFlowOptions{QueuesConfig: `[{"queue_name":"test-queue","worker_pool_id":"test-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`}
+	_, err = NewRedisMQFlow(opts, connOpts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err != nil {
+		t.Errorf("Unexpected error when worker_pool_id exists: %v", err)
+	}
+}
+
+func TestRedisMQFlow_QueueLabels(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close() // nolint:errcheck
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	queueName := "labels-test-queue"
+	msgChannel := make(chan *api.InternalRequest, 10)
+	labels := map[string]string{
+		"foo": "bar",
+		"abc": "xyz",
+	}
+
+	go requestWorker(ctx, rdb, msgChannel, queueName, labels)
+
+	time.Sleep(100 * time.Millisecond)
+
+	ir := api.NewInternalRequest(
+		api.InternalRouting{},
+		&api.RequestMessage{ID: "msg-with-labels", Created: time.Now().Unix(), Deadline: time.Now().Unix() + 3600},
+	)
+	bytes, _ := json.Marshal(ir)
+	rdb.Publish(ctx, queueName, string(bytes))
+
+	select {
+	case msg := <-msgChannel:
+		if msg.PublicRequest == nil || msg.PublicRequest.ReqID() != "msg-with-labels" {
+			t.Fatalf("expected msg-with-labels, got %v", msg)
+		}
+		if msg.Labels == nil {
+			t.Fatal("expected labels, got nil")
+		}
+		if msg.Labels["foo"] != "bar" || msg.Labels["abc"] != "xyz" {
+			t.Fatalf("unexpected labels: %v", msg.Labels)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for message with labels")
 	}
 }

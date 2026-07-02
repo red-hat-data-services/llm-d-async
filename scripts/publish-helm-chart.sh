@@ -37,13 +37,18 @@ command -v helm >/dev/null 2>&1 || {
 }
 
 yq -i '.ap.image.tag = strenv(VERSION)' charts/async-processor/values.yaml
-yq -i '.version = strenv(CHART_VERSION) | .appVersion = strenv(CHART_VERSION)' charts/async-processor/Chart.yaml
+# Chart version must be bare SemVer (OCI/Helm requirement), so it uses the
+# v-stripped CHART_VERSION. appVersion keeps the leading "v" to match the
+# published image tag (images are tagged with the git tag verbatim, e.g.
+# v0.7.1). This makes the recommended empty `ap.image.tag` default — which
+# falls back to .Chart.AppVersion — resolve to a tag that actually exists.
+yq -i '.version = strenv(CHART_VERSION) | .appVersion = strenv(VERSION)' charts/async-processor/Chart.yaml
 
 helm package charts/async-processor -d release/
 
 (cd release && sha256sum "async-processor-${CHART_VERSION}.tgz" >> SHA256SUMS && cat SHA256SUMS)
 
-echo "${GITHUB_TOKEN}" | helm registry login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+printf '%s' "${GITHUB_TOKEN}" | helm registry login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 helm push "release/async-processor-${CHART_VERSION}.tgz" "${HELM_OCI_REGISTRY}"
 
 echo "Helm chart published: ${HELM_OCI_REGISTRY}/async-processor:${CHART_VERSION}"
