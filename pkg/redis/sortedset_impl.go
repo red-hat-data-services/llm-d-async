@@ -3,7 +3,6 @@ package redis
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -14,25 +13,12 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/llm-d-incubation/llm-d-async/api"
 	"github.com/llm-d-incubation/llm-d-async/pipeline"
-	"github.com/llm-d-incubation/llm-d-async/pkg/util"
+	"github.com/llm-d-incubation/llm-d-async/pkg/metrics"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/logging"
-)
-
-var (
-	ssIGWBaseURL         = flag.String("redis.ss.igw-base-url", "", "IGW base URL")
-	ssRequestPathURL     = flag.String("redis.ss.request-path-url", "/v1/completions", "Request path URL")
-	ssInferenceObjective = flag.String("redis.ss.inference-objective", "", "Inference objective header")
-	ssRequestQueueName   = flag.String("redis.ss.request-queue-name", "request-sortedset", "Request sorted set name")
-	ssResultQueueName    = flag.String("redis.ss.result-queue-name", "result-list", "Result list name")
-	ssQueuesConfig       = flag.String("redis.ss.queues-config", "", "Inline JSON queues configuration")
-	ssQueuesConfigFile   = flag.String("redis.ss.queues-config-file", "", "Multiple queues config file")
-	ssPollIntervalMs     = flag.Int("redis.ss.poll-interval-ms", 1000, "Poll interval in milliseconds")
-	ssBatchSize          = flag.Int("redis.ss.batch-size", 10, "Number of messages to process per poll")
-	ssGateType           = flag.String("redis.ss.gate-type", "", "Gate type for single-queue mode (e.g. redis, prometheus-saturation, prometheus-budget)")
-	ssGateParamsJSON     = flag.String("redis.ss.gate-params", "{}", "JSON-encoded gate params map for single-queue mode")
 )
 
 // parseGateParams parses a JSON-encoded string (from --redis.ss.gate-params)
@@ -76,38 +62,49 @@ func (m *StringMap) UnmarshalJSON(data []byte) error {
 }
 
 type queueConfig struct {
-	ID                 string    `json:"id,omitempty"`
-	QueueName          string    `json:"queue_name,omitempty"`
-	ResultQueueName    string    `json:"result_queue_name,omitempty"`
-	InferenceObjective string    `json:"inference_objective"`
-	RequestPathURL     string    `json:"request_path_url"`
-	IGWBaseURL         string    `json:"igw_base_url"`
-	GateType           string    `json:"gate_type"`
-	GateParams         StringMap `json:"gate_params,omitempty"`
+	ID                 string            `json:"id,omitempty"`
+	QueueName          string            `json:"queue_name,omitempty"`
+	ResultQueueName    string            `json:"result_queue_name,omitempty"`
+	WorkerPoolID       string            `json:"worker_pool_id"`
+	InferenceObjective string            `json:"inference_objective"`
+	RequestPathURL     string            `json:"request_path_url"`
+	IGWBaseURL         string            `json:"igw_base_url"`
+	GateType           string            `json:"gate_type"`
+	GateParams         StringMap         `json:"gate_params,omitempty"`
+	Labels             map[string]string `json:"labels,omitempty"`
 }
 
 type requestChannelData struct {
 	channel   pipeline.RequestChannel
 	queueName string
 	queueID   string
-	gate      pipeline.DispatchGate
+	gate      pipeline.Gate
 }
 
-var _ pipeline.Flow = (*RedisSortedSetFlow)(nil)
+var (
+	_ pipeline.Flow          = (*RedisSortedSetFlow)(nil)
+	_ pipeline.HealthChecker = (*RedisSortedSetFlow)(nil)
+)
 
 type RedisSortedSetFlow struct {
-	rdb             *redis.Client
-	requestChannels []requestChannelData
-	retryChannel    chan pipeline.RetryMessage
-	resultChannel   chan api.ResultMessage
-	pollInterval    time.Duration
-	batchSize       int
-	activeReleases  sync.Map
-	gate            pipeline.DispatchGate
-	gateFactory     pipeline.GateFactory
-	configMap       map[string]queueConfig
-	drainCancel     context.CancelFunc
-	drainWg         sync.WaitGroup
+	rdb                     *redis.Client
+	requestChannels         []requestChannelData
+	retryChannel            chan pipeline.RetryMessage
+	resultChannel           chan api.ResultMessage
+	pollInterval            time.Duration
+	batchSize               int
+	activeReleases          sync.Map
+	gate                    pipeline.Gate
+	gateFactory             pipeline.GateFactory
+	configMap               map[string]queueConfig
+	defaultRequestQueueName string
+	defaultResultQueueName  string
+	workerPools             []pipeline.WorkerPoolConfig
+	consumeCancel           context.CancelFunc
+	consumeWg               sync.WaitGroup
+	drainCancel             context.CancelFunc
+	drainWg                 sync.WaitGroup
+	enableTracing           bool
 }
 
 // SortedSetOption is a functional option for configuring RedisSortedSetFlow
@@ -121,31 +118,54 @@ func WithGateFactory(factory pipeline.GateFactory) SortedSetOption {
 	}
 }
 
-func NewRedisSortedSetFlow(opts ...SortedSetOption) (*RedisSortedSetFlow, error) {
-	configs, err := loadQueueConfigs()
+// WithSortedSetRedisTracing enables per-command Redis tracing spans via redisotel.
+func WithSortedSetRedisTracing(enable bool) SortedSetOption {
+	return func(r *RedisSortedSetFlow) {
+		r.enableTracing = enable
+	}
+}
+
+// WithSortedSetWorkerPools sets the pool configurations to resolve named pools.
+func WithSortedSetWorkerPools(workerPools []pipeline.WorkerPoolConfig) SortedSetOption {
+	return func(r *RedisSortedSetFlow) {
+		r.workerPools = workerPools
+	}
+}
+
+func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOptions, fns ...SortedSetOption) (*RedisSortedSetFlow, error) {
+	configs, err := loadQueueConfigs(flowOpts)
 	if err != nil {
 		return nil, err
 	}
-	redisOpts, err := RedisOptions()
+	redisOpts, err := ParseRedisOptions(connOpts.URL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid Redis connection config: %w", err)
 	}
 	r := &RedisSortedSetFlow{
-		rdb:             redis.NewClient(redisOpts),
-		requestChannels: make([]requestChannelData, 0, len(configs)),
-		retryChannel:    make(chan pipeline.RetryMessage),
-		resultChannel:   make(chan api.ResultMessage, resultChannelBuffer),
-		pollInterval:    time.Duration(*ssPollIntervalMs) * time.Millisecond,
-		batchSize:       *ssBatchSize,
+		rdb:                     redis.NewClient(redisOpts),
+		requestChannels:         make([]requestChannelData, 0, len(configs)),
+		retryChannel:            make(chan pipeline.RetryMessage),
+		resultChannel:           make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:            time.Duration(flowOpts.PollIntervalMs) * time.Millisecond,
+		batchSize:               flowOpts.BatchSize,
+		defaultRequestQueueName: flowOpts.RequestQueueName,
+		defaultResultQueueName:  flowOpts.ResultQueueName,
 	}
 
-	for _, opt := range opts {
-		opt(r)
+	for _, fn := range fns {
+		fn(r)
+	}
+
+	if r.enableTracing {
+		if err := redisotel.InstrumentTracing(r.rdb); err != nil {
+			_ = r.rdb.Close()
+			return nil, fmt.Errorf("failed to instrument Redis tracing: %w", err)
+		}
 	}
 
 	r.configMap = make(map[string]queueConfig, len(configs))
 	for _, cfg := range configs {
-		var gate pipeline.DispatchGate
+		var gate pipeline.Gate
 		if r.gateFactory != nil && cfg.GateType != "" {
 			gate, err = r.gateFactory.CreateGate(cfg.GateType, cfg.GateParams)
 			if err != nil {
@@ -157,12 +177,38 @@ func NewRedisSortedSetFlow(opts ...SortedSetOption) (*RedisSortedSetFlow, error)
 			gate = pipeline.ConstOpenGate()
 		}
 
+		workerPoolID := cfg.WorkerPoolID
+		if workerPoolID == "" {
+			workerPoolID = "default"
+		}
+
+		found := false
+		for _, pool := range r.workerPools {
+			if pool.ID == workerPoolID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("worker pool %q specified in queue config not found in pool configuration", workerPoolID)
+		}
+
+		if cfg.IGWBaseURL == "" {
+			return nil, fmt.Errorf("queue config for queue %q: igw_base_url must be specified", cfg.QueueName)
+		}
+
+		reqPath := cfg.RequestPathURL
+		if reqPath == "" {
+			reqPath = "/v1/completions"
+		}
+
 		ch := pipeline.RequestChannel{
 			Channel:            make(chan *api.InternalRequest),
 			InferenceObjective: cfg.InferenceObjective,
-			RequestPathURL:     util.NormalizeURLPath(cfg.RequestPathURL),
-			IGWBaseURL:         util.NormalizeBaseURL(cfg.IGWBaseURL),
+			RequestPathURL:     reqPath,
+			IGWBaseURL:         cfg.IGWBaseURL,
 			Gate:               gate,
+			WorkerPoolID:       workerPoolID,
 		}
 
 		r.configMap[cfg.ID] = cfg
@@ -189,16 +235,16 @@ func parseQueueConfigs(data []byte) ([]queueConfig, error) {
 	return configs, nil
 }
 
-func loadQueueConfigs() ([]queueConfig, error) {
+func loadQueueConfigs(opts SortedSetFlowOptions) ([]queueConfig, error) {
 	var configs []queueConfig
-	if *ssQueuesConfig != "" {
+	if opts.QueuesConfig != "" {
 		var err error
-		configs, err = parseQueueConfigs([]byte(*ssQueuesConfig))
+		configs, err = parseQueueConfigs([]byte(opts.QueuesConfig))
 		if err != nil {
 			return nil, err
 		}
-	} else if *ssQueuesConfigFile != "" {
-		data, err := os.ReadFile(*ssQueuesConfigFile)
+	} else if opts.QueuesConfigFile != "" {
+		data, err := os.ReadFile(opts.QueuesConfigFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read config file: %w", err)
 		}
@@ -208,12 +254,13 @@ func loadQueueConfigs() ([]queueConfig, error) {
 		}
 	} else {
 		configs = []queueConfig{{
-			QueueName:          *ssRequestQueueName,
-			InferenceObjective: *ssInferenceObjective,
-			RequestPathURL:     *ssRequestPathURL,
-			IGWBaseURL:         *ssIGWBaseURL,
-			GateType:           *ssGateType,
-			GateParams:         parseGateParams(*ssGateParamsJSON),
+			QueueName:          opts.RequestQueueName,
+			InferenceObjective: opts.InferenceObjective,
+			IGWBaseURL:         opts.IGWBaseURL,
+			RequestPathURL:     opts.RequestPathURL,
+			GateType:           opts.GateType,
+			GateParams:         parseGateParams(opts.GateParamsJSON),
+			WorkerPoolID:       "default",
 		}}
 	}
 	seenID := make(map[string]bool, len(configs))
@@ -239,15 +286,30 @@ func applyQueueConfigDefaults(cfg *queueConfig) {
 }
 
 func (r *RedisSortedSetFlow) Start(ctx context.Context) {
-	drainCtx, drainCancel := context.WithCancel(log.IntoContext(context.Background(), log.FromContext(ctx)))
+	logger := log.FromContext(ctx)
+	consumeCtx, consumeCancel := context.WithCancel(log.IntoContext(context.Background(), logger))
+	r.consumeCancel = consumeCancel
+
+	drainCtx, drainCancel := context.WithCancel(log.IntoContext(context.Background(), logger))
 	r.drainCancel = drainCancel
 
 	for _, ch := range r.requestChannels {
-		go r.requestWorker(ctx, ch.channel.Channel, ch.queueName, ch.queueID)
+		r.consumeWg.Add(1)
+		go func(ch requestChannelData) {
+			defer r.consumeWg.Done()
+			r.requestWorker(consumeCtx, ch.channel.Channel, ch.queueName, ch.queueID)
+		}(ch)
 	}
 	r.drainWg.Add(2)
 	go func() { defer r.drainWg.Done(); r.retryWorker(drainCtx) }()  // #nosec G118
 	go func() { defer r.drainWg.Done(); r.resultWorker(drainCtx) }() // #nosec G118
+}
+
+func (r *RedisSortedSetFlow) StopConsuming() {
+	if r.consumeCancel != nil {
+		r.consumeCancel()
+	}
+	r.consumeWg.Wait()
 }
 
 func (r *RedisSortedSetFlow) Shutdown() {
@@ -265,12 +327,47 @@ func (r *RedisSortedSetFlow) RequestChannels() []pipeline.RequestChannel {
 	return channels
 }
 
+// QueueBacklog reports the number of pending members in each queue's sorted set.
+func (r *RedisSortedSetFlow) QueueBacklog(ctx context.Context) ([]pipeline.QueueBacklogStat, error) {
+	stats := make([]pipeline.QueueBacklogStat, 0, len(r.requestChannels))
+	var firstErr error
+	for _, cd := range r.requestChannels {
+		depth, err := r.rdb.ZCard(ctx, cd.queueName).Result()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("ZCard on queue %q: %w", cd.queueName, err)
+			}
+			// Report 0 rather than skipping so the gauge does not retain a
+			// stale value for this queue after a failed poll.
+			stats = append(stats, pipeline.QueueBacklogStat{
+				QueueID:   cd.queueID,
+				QueueName: cd.queueName,
+				PoolName:  cd.channel.WorkerPoolID,
+			})
+			continue
+		}
+		stats = append(stats, pipeline.QueueBacklogStat{
+			QueueID:   cd.queueID,
+			QueueName: cd.queueName,
+			PoolName:  cd.channel.WorkerPoolID,
+			Depth:     depth,
+		})
+	}
+	return stats, firstErr
+}
+
+var _ pipeline.BacklogReporter = (*RedisSortedSetFlow)(nil)
+
 func (r *RedisSortedSetFlow) RetryChannel() chan pipeline.RetryMessage {
 	return r.retryChannel
 }
 
 func (r *RedisSortedSetFlow) ResultChannel() chan api.ResultMessage {
 	return r.resultChannel
+}
+
+func (r *RedisSortedSetFlow) HealthCheck(ctx context.Context) error {
+	return r.rdb.Ping(ctx).Err()
 }
 
 func (r *RedisSortedSetFlow) Characteristics() pipeline.Characteristics {
@@ -284,7 +381,7 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan 
 	defer ticker.Stop()
 
 	// Find the gate for this queue
-	var gate pipeline.DispatchGate
+	var gate pipeline.Gate
 	for _, ch := range r.requestChannels {
 		if ch.queueName == queueName {
 			gate = ch.gate
@@ -305,10 +402,15 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan 
 	}
 }
 
-func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string, gate pipeline.DispatchGate, logger logr.Logger) {
+func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string, gate pipeline.Gate, logger logr.Logger) {
 	currentTime := float64(time.Now().Unix())
 
 	budget := gate.Budget(ctx)
+	poolName := ""
+	if cfg, ok := r.configMap[queueID]; ok {
+		poolName = cfg.WorkerPoolID
+	}
+	metrics.SetDispatchBudget(budget, queueID, queueName, poolName)
 	batchSize := int(math.Floor(float64(r.batchSize) * budget))
 
 	for i := 0; i < batchSize; i++ {
@@ -343,33 +445,59 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 		if ir.QueueID == "" {
 			ir.QueueID = queueID
 		}
-
-		// Per-attribute gating
-		var release func()
-		if attrGate, ok := gate.(pipeline.AttributeGate); ok {
-			res, err := attrGate.Acquire(ctx, rview.ReqMetadata())
-			if err != nil {
-				logger.V(logutil.DEFAULT).Error(err, "Failed to acquire attribute quota")
-				// Re-enqueue the message if acquisition fails
-				member, _ := json.Marshal(ir)
-				r.rdb.ZAdd(ctx, queueName, redis.Z{Score: deadline, Member: string(member)})
-				continue
+		if cfg, ok := r.configMap[queueID]; ok && len(cfg.Labels) > 0 {
+			if ir.Labels == nil {
+				ir.Labels = make(map[string]string, len(cfg.Labels))
 			}
-			if !res.Allowed {
-				// Re-enqueue the message (wait for quota)
-				member, _ := json.Marshal(ir)
-				r.rdb.ZAdd(ctx, queueName, redis.Z{Score: deadline, Member: string(member)})
-				continue
+			for k, v := range cfg.Labels {
+				ir.Labels[k] = v
 			}
-			release = res.Release
-			ir.Classification = res.Classification
-		} else {
-			release = func() {}
 		}
 
-		if release != nil {
-			r.activeReleases.Store(rview.ReqID(), release)
+		// Apply gate
+		var releases []pipeline.GateReleaseFunc
+		verdict, err := gate.Apply(ctx, ir, &releases)
+		if err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Gating failed")
+			metrics.RecordGateDecision(metrics.ReasonError, queueID, queueName, poolName)
+			// Re-enqueue the message on gating failure
+			member, _ := json.Marshal(ir)
+			r.rdb.ZAdd(ctx, queueName, redis.Z{Score: deadline, Member: string(member)})
+			continue
 		}
+
+		if verdict.Action == pipeline.ActionRefuse {
+			reason := metrics.ReasonGateClosed
+			if ir.GetClassification() == api.ClassificationOverflow {
+				reason = metrics.ReasonQuotaExhausted
+			}
+			metrics.RecordGateDecision(reason, queueID, queueName, poolName)
+			// Re-enqueue the message (wait for capacity or quota)
+			member, _ := json.Marshal(ir)
+			r.rdb.ZAdd(ctx, queueName, redis.Z{Score: deadline, Member: string(member)})
+			continue
+		}
+
+		if verdict.Action == pipeline.ActionDrop {
+			metrics.RecordGateDecision(metrics.ReasonDropped, queueID, queueName, poolName)
+			if verdict.Result != nil {
+				r.resultChannel <- *verdict.Result
+			} else {
+				r.resultChannel <- api.ResultMessage{
+					ID:      rview.ReqID(),
+					Payload: `{"status": "dropped"}`,
+				}
+			}
+			continue
+		}
+
+		if len(releases) > 0 {
+			r.activeReleases.Store(rview.ReqID(), releases)
+		}
+
+		// Stamp ingestion time as the message enters the in-process buffer so the
+		// worker can record queue residence time when it pulls the message.
+		ir.IngestionTime = time.Now()
 
 		select {
 		case msgChannel <- ir:
@@ -383,9 +511,7 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 			}); err != nil {
 				logger.V(logutil.DEFAULT).Error(err, "Failed to re-queue message on shutdown", "id", rview.ReqID())
 			}
-			if release != nil {
-				release()
-			}
+			pipeline.ReleaseGateReleases(releases)
 			return
 		}
 	}
@@ -453,7 +579,7 @@ func (r *RedisSortedSetFlow) flushRetryBatch(ctx context.Context, batch []pipeli
 		}
 		queueName := msg.RequestQueueName
 		if queueName == "" {
-			queueName = *ssRequestQueueName
+			queueName = r.defaultRequestQueueName
 		}
 		bytes, err := json.Marshal(msg.InternalRequest)
 		if err != nil {
@@ -486,10 +612,11 @@ func (r *RedisSortedSetFlow) flushRetryBatch(ctx context.Context, batch []pipeli
 func (r *RedisSortedSetFlow) resultWorker(ctx context.Context) {
 	processMsg := func(flushCtx context.Context, msg api.ResultMessage) {
 		batch := drainBatch(msg, r.resultChannel, maxBatchSize)
-		// Release quota for all messages in the batch
 		for _, m := range batch {
-			if rel, ok := r.activeReleases.LoadAndDelete(m.ID); ok {
-				rel.(func())()
+			if val, ok := r.activeReleases.LoadAndDelete(m.ID); ok {
+				if rels, ok := val.([]pipeline.GateReleaseFunc); ok {
+					pipeline.ReleaseGateReleases(rels)
+				}
 			}
 		}
 		r.flushResultBatch(flushCtx, batch)
@@ -514,7 +641,7 @@ func (r *RedisSortedSetFlow) resultWorker(ctx context.Context) {
 
 func (r *RedisSortedSetFlow) flushResultBatch(ctx context.Context, batch []api.ResultMessage) {
 	logger := log.FromContext(ctx)
-	defaultQueue := *ssResultQueueName
+	defaultQueue := r.defaultResultQueueName
 	queued := make(map[string][]string)
 	for _, result := range batch {
 		resultQueue := defaultQueue

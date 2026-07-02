@@ -3,6 +3,8 @@ package pubsub
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,13 +20,15 @@ type mockAttributeGate struct {
 }
 
 func (m *mockAttributeGate) Budget(ctx context.Context) float64 { return 1.0 }
-func (m *mockAttributeGate) Acquire(ctx context.Context, attrs map[string]string) (pipeline.AcquireResult, error) {
+func (m *mockAttributeGate) Apply(ctx context.Context, msg *api.InternalRequest, releases *[]pipeline.GateReleaseFunc) (pipeline.Verdict, error) {
 	m.acquireCalled = true
-	return pipeline.AcquireResult{
-		Allowed:        m.allowed,
-		Classification: api.ClassificationReserved,
-		Release:        func() { m.releaseCalled = true },
-	}, nil
+	if !m.allowed {
+		return pipeline.Refuse(), nil
+	}
+	if releases != nil {
+		*releases = append(*releases, func() { m.releaseCalled = true })
+	}
+	return pipeline.Continue(), nil
 }
 
 func TestProcessMessages_QuotaGating(t *testing.T) {
@@ -119,7 +123,169 @@ func TestProcessMessages_QuotaGating(t *testing.T) {
 				}
 			}()
 
-			_ = flow.processMessages(ctx, receive, ch, gate)
+			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil)
 		})
 	}
+}
+
+func TestNewGCPPubSubMQFlow_PoolRequiredAndValidation(t *testing.T) {
+	origEmulatorHost := os.Getenv("PUBSUB_EMULATOR_HOST")
+	_ = os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:8085")
+	defer func() {
+		if origEmulatorHost != "" {
+			_ = os.Setenv("PUBSUB_EMULATOR_HOST", origEmulatorHost)
+		} else {
+			_ = os.Unsetenv("PUBSUB_EMULATOR_HOST")
+		}
+	}()
+
+	tmpFile, err := os.CreateTemp("", "topics-config-*.json")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+
+	baseOpts := Options{ProjectID: "test-project"}
+
+	// Case 1: worker_pool_id is missing, and pool "default" does not exist
+	missingPoolConfig := `[{"subscriber_id":"sub-1","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	if err := os.WriteFile(tmpFile.Name(), []byte(missingPoolConfig), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	opts := baseOpts
+	opts.TopicsConfigFile = tmpFile.Name()
+
+	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil || !strings.Contains(err.Error(), "not found in pool configuration") {
+		t.Errorf("Expected error about missing pool, got: %v", err)
+	}
+
+	// Case 5: worker_pool_id is missing, but only a single 'default' pool is specified
+	if err := os.WriteFile(tmpFile.Name(), []byte(missingPoolConfig), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	opts = baseOpts
+	opts.TopicsConfigFile = tmpFile.Name()
+
+	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	if err != nil {
+		t.Errorf("Unexpected error when worker_pool_id is missing but default pool exists: %v", err)
+	}
+
+	// Case 6: worker_pool_id is specified as custom, but only a single 'default' pool is specified
+	customPoolConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"custom-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	if err := os.WriteFile(tmpFile.Name(), []byte(customPoolConfig), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	opts = baseOpts
+	opts.TopicsConfigFile = tmpFile.Name()
+
+	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when worker_pool_id is custom but only default pool exists")
+	}
+
+	// Case 2: worker_pool_id specified but pool does not exist
+	nonExistentPoolConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"non-existent","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	if err := os.WriteFile(tmpFile.Name(), []byte(nonExistentPoolConfig), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	opts = baseOpts
+	opts.TopicsConfigFile = tmpFile.Name()
+
+	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil || !strings.Contains(err.Error(), "not found in pool configuration") {
+		t.Errorf("Expected error about missing pool, got: %v", err)
+	}
+
+	// Case 3: worker_pool_id specified and pool exists, but igw_base_url is missing
+	missingIgwConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"test-pool","inference_objective":"obj"}]`
+	if err := os.WriteFile(tmpFile.Name(), []byte(missingIgwConfig), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	opts = baseOpts
+	opts.TopicsConfigFile = tmpFile.Name()
+
+	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil || !strings.Contains(err.Error(), "igw_base_url must be specified") {
+		t.Errorf("Expected error about missing igw_base_url, got: %v", err)
+	}
+
+	// Case 4: worker_pool_id and igw_base_url specified and pool exists
+	validConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"test-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	if err := os.WriteFile(tmpFile.Name(), []byte(validConfig), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+	opts = baseOpts
+	opts.TopicsConfigFile = tmpFile.Name()
+
+	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err != nil {
+		t.Errorf("Unexpected error when worker_pool_id and igw_base_url exist: %v", err)
+	}
+}
+
+func (m *mockAttributeGate) Release(ctx context.Context, msg *api.InternalRequest) error { return nil }
+
+func TestProcessMessages_LabelsPropagation(t *testing.T) {
+	flow := &PubSubMQFlow{
+		resultChannel: make(chan api.ResultMessage, 10),
+	}
+	ch := make(chan *api.InternalRequest, 10)
+	gate := &mockAttributeGate{allowed: true}
+
+	msgData, _ := json.Marshal(api.RequestMessage{ID: "test-msg"})
+	receive := func(ctx context.Context, f func(context.Context, *pubsub.Message)) error {
+		msg := &pubsub.Message{
+			ID:   "msg-1",
+			Data: msgData,
+		}
+		f(ctx, msg)
+		return nil
+	}
+
+	labels := map[string]string{
+		"env":     "prod",
+		"version": "1.2.3",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Spin up a goroutine to capture the request and unblock processMessages
+	var receivedIR *api.InternalRequest
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case ir := <-ch:
+			receivedIR = ir
+			// Unblock processMessages
+			pubsubID := ir.TransportCorrelationID
+			if val, ok := resultChannels.Load(pubsubID); ok {
+				resCh := val.(chan bool)
+				resCh <- true
+			}
+		case <-ctx.Done():
+		}
+	}()
+
+	// We wrap in a recover to catch panics from Ack/Nack on uninitialized messages,
+	// which is expected because we don't fully mock pubsub.Message.
+	defer func() {
+		_ = recover()
+		// After recover, check the captured request
+		if receivedIR == nil {
+			t.Fatal("expected a request to be received, got nil")
+		}
+		if receivedIR.Labels == nil {
+			t.Fatal("expected labels, got nil")
+		}
+		if receivedIR.Labels["env"] != "prod" || receivedIR.Labels["version"] != "1.2.3" {
+			t.Fatalf("unexpected labels: %v", receivedIR.Labels)
+		}
+	}()
+
+	_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, labels)
+	<-done
 }

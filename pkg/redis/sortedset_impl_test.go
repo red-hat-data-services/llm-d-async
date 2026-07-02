@@ -18,7 +18,7 @@ import (
 )
 
 // noopGate returns a gate that always returns full budget (1.0)
-func noopGate() pipeline.DispatchGate {
+func noopGate() pipeline.Gate {
 	return pipeline.ConstOpenGate()
 }
 
@@ -47,7 +47,7 @@ func TestParseQueueConfigs(t *testing.T) {
 	}{
 		{
 			name:    "single queue with string gate params",
-			input:   `[{"queue_name":"q1","gate_type":"redis","gate_params":{"address":"localhost:6379"}}]`,
+			input:   `[{"queue_name":"q1","igw_base_url":"http://gw","gate_type":"redis","gate_params":{"address":"localhost:6379"}}]`,
 			wantLen: 1,
 			validate: func(t *testing.T, configs []queueConfig) {
 				if configs[0].QueueName != "q1" {
@@ -60,7 +60,7 @@ func TestParseQueueConfigs(t *testing.T) {
 		},
 		{
 			name:    "numeric gate params coerced to strings",
-			input:   `[{"queue_name":"q1","gate_type":"prometheus-saturation","gate_params":{"threshold":0.7,"pool":"p1"}}]`,
+			input:   `[{"queue_name":"q1","igw_base_url":"http://gw","gate_type":"prometheus-saturation","gate_params":{"threshold":0.7,"pool":"p1"}}]`,
 			wantLen: 1,
 			validate: func(t *testing.T, configs []queueConfig) {
 				if configs[0].GateParams["threshold"] != "0.7" {
@@ -73,7 +73,7 @@ func TestParseQueueConfigs(t *testing.T) {
 		},
 		{
 			name:    "multiple queues",
-			input:   `[{"queue_name":"q1","igw_base_url":"http://igw:80"},{"queue_name":"q2","gate_type":"redis","gate_params":{"address":"redis:6379"}}]`,
+			input:   `[{"queue_name":"q1","igw_base_url":"http://igw:80"},{"queue_name":"q2","igw_base_url":"http://gw","gate_type":"redis","gate_params":{"address":"redis:6379"}}]`,
 			wantLen: 2,
 			validate: func(t *testing.T, configs []queueConfig) {
 				if configs[0].QueueName != "q1" {
@@ -86,7 +86,7 @@ func TestParseQueueConfigs(t *testing.T) {
 		},
 		{
 			name:    "no gate params",
-			input:   `[{"queue_name":"q1","request_path_url":"/v1/completions"}]`,
+			input:   `[{"queue_name":"q1","igw_base_url":"http://gw","request_path_url":"/v1/completions"}]`,
 			wantLen: 1,
 			validate: func(t *testing.T, configs []queueConfig) {
 				if len(configs[0].GateParams) != 0 {
@@ -425,16 +425,13 @@ func TestSortedSetFlow_ResultFIFO(t *testing.T) {
 	defer cancel()
 
 	queue := "result-queue"
-	origQueue := *ssResultQueueName
-	*ssResultQueueName = queue
-	defer func() { *ssResultQueueName = origQueue }()
-
 	flow := &RedisSortedSetFlow{
-		rdb:           rdb,
-		resultChannel: make(chan api.ResultMessage, 2),
-		pollInterval:  50 * time.Millisecond,
-		batchSize:     10,
-		gate:          noopGate(),
+		defaultResultQueueName: queue,
+		rdb:                    rdb,
+		resultChannel:          make(chan api.ResultMessage, 2),
+		pollInterval:           50 * time.Millisecond,
+		batchSize:              10,
+		gate:                   noopGate(),
 	}
 
 	go flow.resultWorker(ctx)
@@ -463,16 +460,13 @@ func TestSortedSetFlow_ResultBatch(t *testing.T) {
 	defer cancel()
 
 	queue := "batch-result-queue"
-	origQueue := *ssResultQueueName
-	*ssResultQueueName = queue
-	defer func() { *ssResultQueueName = origQueue }()
-
 	flow := &RedisSortedSetFlow{
-		rdb:           rdb,
-		resultChannel: make(chan api.ResultMessage, resultChannelBuffer),
-		pollInterval:  50 * time.Millisecond,
-		batchSize:     10,
-		gate:          noopGate(),
+		defaultResultQueueName: queue,
+		rdb:                    rdb,
+		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:           50 * time.Millisecond,
+		batchSize:              10,
+		gate:                   noopGate(),
 	}
 
 	// Pre-fill the channel before starting the worker so all messages
@@ -516,16 +510,14 @@ func TestSortedSetFlow_ResultBatchMultiQueue(t *testing.T) {
 	defer cancel()
 
 	defaultQueue := "default-result-queue"
-	origQueue := *ssResultQueueName
-	*ssResultQueueName = defaultQueue
-	defer func() { *ssResultQueueName = origQueue }()
 
 	flow := &RedisSortedSetFlow{
-		rdb:           rdb,
-		resultChannel: make(chan api.ResultMessage, resultChannelBuffer),
-		pollInterval:  50 * time.Millisecond,
-		batchSize:     10,
-		gate:          noopGate(),
+		rdb:                    rdb,
+		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:           50 * time.Millisecond,
+		batchSize:              10,
+		gate:                   noopGate(),
+		defaultResultQueueName: defaultQueue,
 		configMap: map[string]queueConfig{
 			"queue-a": {ID: "queue-a", QueueName: "request:queue-a", ResultQueueName: "result:queue-a"},
 			"queue-b": {ID: "queue-b", QueueName: "request:queue-b", ResultQueueName: "result:queue-b"},
@@ -655,15 +647,17 @@ func TestSortedSetFlow_Integration(t *testing.T) {
 	defer cancel()
 
 	queue := "integration-queue"
-	origQueue := *ssRequestQueueName
-	*ssRequestQueueName = queue
-	defer func() { *ssRequestQueueName = origQueue }()
 
-	origURL := *RedisURL
-	*RedisURL = "redis://" + s.Addr()
-	defer func() { *RedisURL = origURL }()
-
-	flow, err := NewRedisSortedSetFlow()
+	flowOpts := SortedSetFlowOptions{
+		RequestQueueName: queue,
+		IGWBaseURL:       "http://gw",
+		ResultQueueName:  "result-list",
+		PollIntervalMs:   1000,
+		BatchSize:        10,
+		GateParamsJSON:   "{}",
+	}
+	connOpts := ConnectionOptions{URL: "redis://" + s.Addr()}
+	flow, err := NewRedisSortedSetFlow(flowOpts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,16 +754,13 @@ func TestSortedSetFlow_ResultRetryAfterFailure(t *testing.T) {
 	defer cancel()
 
 	queue := "retry-result-queue"
-	origQueue := *ssResultQueueName
-	*ssResultQueueName = queue
-	defer func() { *ssResultQueueName = origQueue }()
-
 	flow := &RedisSortedSetFlow{
-		rdb:           rdb,
-		resultChannel: make(chan api.ResultMessage, resultChannelBuffer),
-		pollInterval:  50 * time.Millisecond,
-		batchSize:     10,
-		gate:          noopGate(),
+		defaultResultQueueName: queue,
+		rdb:                    rdb,
+		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:           50 * time.Millisecond,
+		batchSize:              10,
+		gate:                   noopGate(),
 	}
 
 	// Inject an error so the first Exec fails.
@@ -1191,16 +1182,14 @@ func TestSortedSetFlow_ResultQueueIgnoresMessagePayload(t *testing.T) {
 
 	configResult := "config-result-queue"
 	messageResult := "message-result-queue"
-	origQueue := *ssResultQueueName
-	*ssResultQueueName = "global-default"
-	defer func() { *ssResultQueueName = origQueue }()
 
 	flow := &RedisSortedSetFlow{
-		rdb:           rdb,
-		resultChannel: make(chan api.ResultMessage, resultChannelBuffer),
-		pollInterval:  50 * time.Millisecond,
-		batchSize:     10,
-		gate:          noopGate(),
+		rdb:                    rdb,
+		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:           50 * time.Millisecond,
+		batchSize:              10,
+		gate:                   noopGate(),
+		defaultResultQueueName: "global-default",
 		configMap: map[string]queueConfig{
 			"my-queue": {ID: "my-queue", ResultQueueName: configResult},
 		},
@@ -1233,16 +1222,14 @@ func TestSortedSetFlow_ResultQueueFallsBackToMessageLevel(t *testing.T) {
 	defer cancel()
 
 	messageResult := "producer-result-queue"
-	origQueue := *ssResultQueueName
-	*ssResultQueueName = "global-default"
-	defer func() { *ssResultQueueName = origQueue }()
 
 	flow := &RedisSortedSetFlow{
-		rdb:           rdb,
-		resultChannel: make(chan api.ResultMessage, resultChannelBuffer),
-		pollInterval:  50 * time.Millisecond,
-		batchSize:     10,
-		gate:          noopGate(),
+		rdb:                    rdb,
+		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:           50 * time.Millisecond,
+		batchSize:              10,
+		gate:                   noopGate(),
+		defaultResultQueueName: "global-default",
 		configMap: map[string]queueConfig{
 			"no-result-cfg": {ID: "no-result-cfg", QueueName: "req", ResultQueueName: ""},
 		},
@@ -1272,5 +1259,185 @@ func TestSortedSetFlow_ResultQueueFallsBackToMessageLevel(t *testing.T) {
 	globalLen, _ := rdb.LLen(ctx, "global-default").Result()
 	if globalLen != 1 {
 		t.Errorf("Expected 1 message in global default queue, got %d", globalLen)
+	}
+}
+
+func TestNewRedisSortedSetFlow_PoolRequiredAndValidation(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	connOpts := ConnectionOptions{URL: "redis://" + s.Addr()}
+	baseOpts := SortedSetFlowOptions{PollIntervalMs: 1000, BatchSize: 10, GateParamsJSON: "{}"}
+
+	// Case 1: worker_pool_id is missing from configuration, and pool "default" does not exist
+	opts := baseOpts
+	opts.QueuesConfig = `[{"queue_name":"test-queue","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	_, err := NewRedisSortedSetFlow(opts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when worker_pool_id is missing and 'default' pool does not exist, got nil")
+	}
+
+	// Case 5: worker_pool_id is missing, but only a single 'default' pool is specified
+	opts = baseOpts
+	opts.QueuesConfig = `[{"queue_name":"test-queue","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	_, err = NewRedisSortedSetFlow(opts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	if err != nil {
+		t.Errorf("Unexpected error when worker_pool_id is missing but default pool exists: %v", err)
+	}
+
+	// Case 6: worker_pool_id is specified as custom, but only a single 'default' pool is specified
+	opts = baseOpts
+	opts.QueuesConfig = `[{"queue_name":"test-queue","worker_pool_id":"custom-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	_, err = NewRedisSortedSetFlow(opts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when worker_pool_id is custom but only default pool exists, got nil")
+	}
+
+	// Case 2: worker_pool_id is specified but pool does not exist
+	opts = baseOpts
+	opts.QueuesConfig = `[{"queue_name":"test-queue","worker_pool_id":"non-existent","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	_, err = NewRedisSortedSetFlow(opts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when specified worker_pool_id does not exist, got nil")
+	}
+
+	// Case 3: worker_pool_id specified and pool exists, but igw_base_url is missing
+	opts = baseOpts
+	opts.QueuesConfig = `[{"queue_name":"test-queue","worker_pool_id":"test-pool","inference_objective":"obj"}]`
+	_, err = NewRedisSortedSetFlow(opts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err == nil {
+		t.Error("Expected error when igw_base_url is missing in queue config, got nil")
+	}
+
+	// Case 4: worker_pool_id and igw_base_url specified and pool exists
+	opts = baseOpts
+	opts.QueuesConfig = `[{"queue_name":"test-queue","worker_pool_id":"test-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`
+	_, err = NewRedisSortedSetFlow(opts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	if err != nil {
+		t.Errorf("Unexpected error when worker_pool_id exists: %v", err)
+	}
+}
+
+func TestQueueBacklog(t *testing.T) {
+	_, rdb, ctx, cancel := setupTest(t)
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	flow := &RedisSortedSetFlow{
+		rdb: rdb,
+		requestChannels: []requestChannelData{
+			{queueName: "queue-a", queueID: "a"},
+			{queueName: "queue-b", queueID: "b"},
+		},
+	}
+
+	// queue-a gets 3 members, queue-b gets 1, an unrelated key is ignored.
+	for i, m := range []string{"m1", "m2", "m3"} {
+		rdb.ZAdd(ctx, "queue-a", redis.Z{Score: float64(i), Member: m})
+	}
+	rdb.ZAdd(ctx, "queue-b", redis.Z{Score: 0, Member: "only"})
+
+	stats, err := flow.QueueBacklog(ctx)
+	if err != nil {
+		t.Fatalf("QueueBacklog returned error: %v", err)
+	}
+
+	got := make(map[string]int64, len(stats))
+	for _, s := range stats {
+		got[s.QueueName] = s.Depth
+	}
+	if got["queue-a"] != 3 {
+		t.Errorf("queue-a backlog = %d, want 3", got["queue-a"])
+	}
+	if got["queue-b"] != 1 {
+		t.Errorf("queue-b backlog = %d, want 1", got["queue-b"])
+	}
+}
+
+// TestQueueBacklogReportsZeroOnError verifies that a per-queue failure reports a
+// 0 sentinel for that queue (rather than skipping it) so the gauge does not
+// retain a stale value, while healthy queues still report their real depth.
+func TestQueueBacklogReportsZeroOnError(t *testing.T) {
+	_, rdb, ctx, cancel := setupTest(t)
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	flow := &RedisSortedSetFlow{
+		rdb: rdb,
+		requestChannels: []requestChannelData{
+			{queueName: "queue-ok", queueID: "ok"},
+			{queueName: "queue-bad", queueID: "bad"},
+		},
+	}
+
+	rdb.ZAdd(ctx, "queue-ok", redis.Z{Score: 0, Member: "m1"})
+	// Make queue-bad a string so ZCard fails with WRONGTYPE.
+	rdb.Set(ctx, "queue-bad", "not-a-sorted-set", 0)
+
+	stats, err := flow.QueueBacklog(ctx)
+	if err == nil {
+		t.Fatal("QueueBacklog expected an error for the WRONGTYPE queue, got nil")
+	}
+
+	got := make(map[string]int64, len(stats))
+	for _, s := range stats {
+		got[s.QueueName] = s.Depth
+	}
+	if _, ok := got["queue-bad"]; !ok {
+		t.Error("queue-bad missing from stats; want a 0 sentinel instead of being skipped")
+	}
+	if got["queue-bad"] != 0 {
+		t.Errorf("queue-bad backlog = %d, want 0", got["queue-bad"])
+	}
+	if got["queue-ok"] != 1 {
+		t.Errorf("queue-ok backlog = %d, want 1", got["queue-ok"])
+	}
+}
+
+func TestSortedSetFlow_QueueLabelsSetOnDequeue(t *testing.T) {
+	s, rdb, ctx, cancel := setupTest(t)
+	defer s.Close()
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	queue := "test-labels-queue"
+	queueID := "test-labels-qid"
+	labels := map[string]string{
+		"foo": "bar",
+		"abc": "xyz",
+	}
+
+	flow := &RedisSortedSetFlow{
+		rdb: rdb,
+		requestChannels: []requestChannelData{{
+			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+			queueName: queue,
+			queueID:   queueID,
+		}},
+		pollInterval: 50 * time.Millisecond,
+		batchSize:    10,
+		gate:         noopGate(),
+		configMap: map[string]queueConfig{
+			queueID: {
+				ID:     queueID,
+				Labels: labels,
+			},
+		},
+	}
+
+	msg := api.RequestMessage{ID: "msg-labels", Created: time.Now().Unix(), Deadline: 9999999999}
+	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
+
+	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, queueID)
+
+	select {
+	case received := <-flow.requestChannels[0].channel.Channel:
+		if received.Labels == nil {
+			t.Fatal("Expected labels on dequeued request, got nil")
+		}
+		if received.Labels["foo"] != "bar" || received.Labels["abc"] != "xyz" {
+			t.Fatalf("Unexpected labels: %v", received.Labels)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout waiting for message")
 	}
 }

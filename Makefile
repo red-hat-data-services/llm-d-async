@@ -87,13 +87,15 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: fmt
-fmt: ## Run go fmt against root and producer modules.
+fmt: ## Run go fmt against root, api, and producer modules.
 	go fmt ./...
+	cd api && go fmt ./...
 	cd producer && go fmt ./...
 
 .PHONY: vet
-vet: ## Run go vet against root and producer modules.
+vet: ## Run go vet against root, api, and producer modules.
 	go vet ./...
+	cd api && go vet ./...
 	cd producer && go vet ./...
 
 .PHONY: test
@@ -316,6 +318,14 @@ golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 
+GOIMPORTS_VERSION ?= v0.34.0
+GOSEC_VERSION ?= v2.22.4
+
+.PHONY: install-pre-commit-tools
+install-pre-commit-tools: golangci-lint ## Install tools required by pre-commit hooks.
+	go install golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION)
+	go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)
+
 GINKGO ?= $(LOCALBIN)/ginkgo
 GINKGO_VERSION ?= v2.28.1
 
@@ -339,6 +349,48 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $(1)-$(3) $(1)
 endef
+
+##@ Release
+
+# SUBMODULES discovers Go sub-modules by finding subdirectories with their own go.mod.
+SUBMODULES := $(patsubst %/go.mod,%,$(wildcard */go.mod))
+
+## set-version: Update cross-module require versions in all go.mod files (e.g. make set-version VERSION=v0.8.0)
+.PHONY: set-version
+set-version:
+	@if [ -z "$(VERSION)" ]; then \
+	  echo "VERSION is required (e.g. make set-version VERSION=v0.8.0)"; exit 1; \
+	fi
+	@if [ -z "$(SUBMODULES)" ]; then \
+	  echo "No submodules detected (no */go.mod found). Nothing to update."; exit 1; \
+	fi
+	@echo "Setting cross-module versions to $(VERSION)..."
+	@echo "Detected submodules: $(SUBMODULES)"
+	@for f in go.mod $(foreach m,$(SUBMODULES),$(m)/go.mod); do \
+	  if [ -f "$$f" ]; then \
+	    dir=$$(dirname "$$f"); \
+	    for sub in $(SUBMODULES); do \
+	      if grep -q "github.com/llm-d-incubation/llm-d-async/$$sub " "$$f"; then \
+	        (cd "$$dir" && go mod edit -require "github.com/llm-d-incubation/llm-d-async/$$sub@$(VERSION)"); \
+	      fi; \
+	    done; \
+	  fi; \
+	done
+	@echo "Running go mod tidy..."
+	@go mod tidy
+	@for d in $(SUBMODULES); do \
+	  if [ -f "$$d/go.mod" ]; then (cd "$$d" && go mod tidy); fi; \
+	done
+	@echo "Updated cross-module versions:"
+	@printf "  %-20s %-12s %s\n" "SOURCE" "REQUIRES" "VERSION"
+	@for d in . $(SUBMODULES); do \
+	  if [ -f "$$d/go.mod" ]; then \
+	    (cd "$$d" && go mod edit -json | jq -r '.Require[]? | select(.Path | startswith("github.com/llm-d-incubation/llm-d-async/")) | "\(.Path | ltrimstr("github.com/llm-d-incubation/llm-d-async/")) \(.Version)"') \
+	    | while read sub ver; do \
+	      printf "  %-20s %-12s %s\n" "$$d/go.mod" "$$sub" "$$ver"; \
+	    done; \
+	  fi; \
+	done
 
 ## Copied from https://github.com/llm-d-incubation/batch-gateway
 ## publish-helm-chart: Patch chart for VERSION, package, append chart to SHA256SUMS, push to oci://ghcr.io/llm-d-incubation/charts (requires VERSION, yq, helm; GITHUB_TOKEN, GITHUB_ACTOR for push).
