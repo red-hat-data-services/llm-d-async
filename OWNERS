@@ -1,15 +1,13 @@
 approvers:
-- shimib
-- ahg-g
-- jtechapps
-- RishabhSaini
 - evacchi
 - vishbhat
+- lioraron
+- yizhaodev
+- zdtsw
 
 reviewers:
-- shimib
-- ahg-g
-- jtechapps
-- RishabhSaini
 - evacchi
 - vishbhat
+- lioraron
+- yizhaodev
+- zdtsw
