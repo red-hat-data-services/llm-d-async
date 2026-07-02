@@ -31,6 +31,11 @@ import (
 // DefaultCacheTTL is the default TTL for cached Prometheus metric sources.
 const DefaultCacheTTL = 5 * time.Second
 
+type gateConfig struct {
+	GateType   string            `json:"gate_type"`
+	GateParams map[string]string `json:"gate_params"`
+}
+
 var _ pipeline.GateFactory = (*GateFactory)(nil)
 
 // GateFactory creates DispatchGate instances based on configuration.
@@ -94,7 +99,7 @@ func (f *GateFactory) Close() error {
 //     Params: query (required), fallback (default 0.0)
 //
 // For unsupported or unknown gate types, returns ConstOpenGate as a safe default.
-func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pipeline.DispatchGate, error) {
+func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pipeline.Gate, error) {
 	switch gateType {
 	case "composite":
 		gatesJSON := params["gates"]
@@ -102,17 +107,12 @@ func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pip
 			return nil, fmt.Errorf("composite gate requires 'gates' parameter with JSON array of gate configurations")
 		}
 
-		type gateConfig struct {
-			GateType   string            `json:"gate_type"`
-			GateParams map[string]string `json:"gate_params"`
-		}
-
 		var configs []gateConfig
 		if err := json.Unmarshal([]byte(gatesJSON), &configs); err != nil {
 			return nil, fmt.Errorf("composite gate failed to parse 'gates' parameter: %w", err)
 		}
 
-		var innerGates []pipeline.DispatchGate
+		var innerGates []pipeline.Gate
 		for _, cfg := range configs {
 			gate, err := f.CreateGate(cfg.GateType, cfg.GateParams)
 			if err != nil {
@@ -122,6 +122,24 @@ func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pip
 		}
 
 		return NewCompositeGate(innerGates...), nil
+
+	case "wait-on-refuse":
+		gateJSON := params["gate"]
+		if gateJSON == "" {
+			return nil, fmt.Errorf("wait-on-refuse gate requires a 'gate' parameter with the inner gate configuration")
+		}
+
+		var cfg gateConfig
+		if err := json.Unmarshal([]byte(gateJSON), &cfg); err != nil {
+			return nil, fmt.Errorf("wait-on-refuse gate failed to parse 'gate' parameter: %w", err)
+		}
+
+		innerGate, err := f.CreateGate(cfg.GateType, cfg.GateParams)
+		if err != nil {
+			return nil, fmt.Errorf("wait-on-refuse gate failed to create inner gate %q: %w", cfg.GateType, err)
+		}
+
+		return NewWaitOnRefuseGate(innerGate), nil
 
 	case "constant":
 		return ConstOpenGate(), nil
@@ -244,12 +262,13 @@ func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pip
 		}
 
 		promConfig := promapi.Config{Address: f.prometheusURL}
+		namespace := params["namespace"]
 
-		primary, err := NewFlowControlQueueSizePromQL(promConfig, pool, maxConcurrency)
+		primary, err := NewFlowControlQueueSizePromQL(promConfig, pool, maxConcurrency, namespace)
 		if err != nil {
 			return nil, err
 		}
-		secondary, err := NewVLLMSaturationPromQL(promConfig, pool, maxConcurrency)
+		secondary, err := NewVLLMSaturationPromQL(promConfig, pool, maxConcurrency, namespace)
 		if err != nil {
 			return nil, err
 		}
@@ -281,6 +300,79 @@ func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pip
 			return nil, err
 		}
 		return NewMetricDispatchGate(cachedSource(source, f.cacheTTL), 0.0, fallback), nil
+
+	case "endpoint-scrape":
+		url := params["url"]
+		if url == "" {
+			return nil, fmt.Errorf("endpoint-scrape gate requires a 'url' parameter")
+		}
+		metric := params["metric"]
+		if metric == "" {
+			return nil, fmt.Errorf("endpoint-scrape gate requires a 'metric' parameter")
+		}
+
+		var labels map[string]string
+		if labelsJSON := params["labels"]; labelsJSON != "" {
+			if err := json.Unmarshal([]byte(labelsJSON), &labels); err != nil {
+				return nil, fmt.Errorf("endpoint-scrape gate failed to parse 'labels': %w", err)
+			}
+		}
+
+		maxCountPerPod, err := parseFloat("max_count_per_pod", params["max_count_per_pod"], 0)
+		if err != nil {
+			return nil, err
+		}
+		baseline, err := parseFloat("baseline", params["baseline"], 0.0)
+		if err != nil {
+			return nil, err
+		}
+		fallback, err := parseFloat("fallback", params["fallback"], 0.0)
+		if err != nil {
+			return nil, err
+		}
+
+		var podsLabels map[string]string
+		if podsLabelsJSON := params["pods_labels"]; podsLabelsJSON != "" {
+			if err := json.Unmarshal([]byte(podsLabelsJSON), &podsLabels); err != nil {
+				return nil, fmt.Errorf("endpoint-scrape gate failed to parse 'pods_labels': %w", err)
+			}
+		}
+
+		cfg := ScrapeConfig{
+			URL:            url,
+			MetricName:     metric,
+			Labels:         labels,
+			MaxCountPerPod: maxCountPerPod,
+			PodsURL:        params["pods_url"],
+			PodsMetric:     params["pods_metric"],
+			PodsLabels:     podsLabels,
+		}
+
+		var ms MetricSource = NewScrapeMetricSource(cfg)
+		ms = cachedSource(ms, f.cacheTTL)
+		return NewMetricDispatchGate(ms, baseline, fallback), nil
+
+	case "local-max-concurrency":
+		limitStr := params["limit"]
+		if limitStr == "" {
+			return nil, fmt.Errorf("local-max-concurrency gate requires a 'limit' parameter")
+		}
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil {
+			return nil, fmt.Errorf("local-max-concurrency gate requires a valid integer 'limit': %w", err)
+		}
+		if limit <= 0 {
+			return nil, fmt.Errorf("local-max-concurrency limit must be greater than 0, got %d", limit)
+		}
+		gate := NewLocalConcurrencyGate(limit)
+		gatingMode := params["gating_mode"]
+		if gatingMode != "" {
+			if gatingMode != string(GatingModeBlocking) && gatingMode != string(GatingModeClassifying) {
+				return nil, fmt.Errorf("local-max-concurrency gating_mode must be either 'blocking' or 'classifying', got %q", gatingMode)
+			}
+			gate.WithGatingMode(GatingMode(gatingMode))
+		}
+		return gate, nil
 
 	default:
 		// Unknown gate types default to open gate
