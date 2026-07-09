@@ -525,13 +525,10 @@ func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc,
 			var resultMsg api.ResultMessage
 			if verdict.Result != nil {
 				resultMsg = *verdict.Result
+				resultMsg.Routing = ir.InternalRouting
 			} else {
-				resultMsg = api.ResultMessage{
-					ID:      body.ID,
-					Payload: `{"status": "dropped"}`,
-				}
+				resultMsg = api.NewGateDroppedResult(&body, ir.InternalRouting)
 			}
-			resultMsg.Routing = ir.InternalRouting
 			r.resultChannel <- resultMsg
 
 			// Wait for the result worker to finish publishing and signal true
