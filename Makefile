@@ -7,7 +7,7 @@ export
 
 
 # Image URL to use all building/pushing image targets
-IMAGE_TAG_BASE ?= ghcr.io/llm-d-incubation
+IMAGE_TAG_BASE ?= ghcr.io/llm-d
 IMG_TAG ?= latest
 IMG ?= $(IMAGE_TAG_BASE)/async-processor:$(IMG_TAG)
 
@@ -21,9 +21,9 @@ DATE := $(DATE)
 
 # Build flags
 LDFLAGS := -s -w \
-	-X github.com/llm-d-incubation/llm-d-async/pkg/version.Version=$(VERSION) \
-	-X github.com/llm-d-incubation/llm-d-async/pkg/version.Commit=$(COMMIT) \
-	-X github.com/llm-d-incubation/llm-d-async/pkg/version.BuildDate=$(DATE)
+	-X github.com/llm-d/llm-d-async/pkg/version.Version=$(VERSION) \
+	-X github.com/llm-d/llm-d-async/pkg/version.Commit=$(COMMIT) \
+	-X github.com/llm-d/llm-d-async/pkg/version.BuildDate=$(DATE)
 
 # KIND_ARGS etc.
 KIND_ARGS ?= -t mix -n 3 -g 2   # Default: 3 nodes, 2 GPUs per node, mixed vendors
@@ -378,8 +378,8 @@ set-version:
 	  if [ -f "$$f" ]; then \
 	    dir=$$(dirname "$$f"); \
 	    for sub in $(SUBMODULES); do \
-	      if grep -q "github.com/llm-d-incubation/llm-d-async/$$sub " "$$f"; then \
-	        (cd "$$dir" && go mod edit -require "github.com/llm-d-incubation/llm-d-async/$$sub@$(VERSION)"); \
+	      if grep -q "github.com/llm-d/llm-d-async/$$sub " "$$f"; then \
+	        (cd "$$dir" && go mod edit -require "github.com/llm-d/llm-d-async/$$sub@$(VERSION)"); \
 	      fi; \
 	    done; \
 	  fi; \
@@ -393,7 +393,7 @@ set-version:
 	@printf "  %-20s %-12s %s\n" "SOURCE" "REQUIRES" "VERSION"
 	@for d in . $(SUBMODULES); do \
 	  if [ -f "$$d/go.mod" ]; then \
-	    (cd "$$d" && go mod edit -json | jq -r '.Require[]? | select(.Path | startswith("github.com/llm-d-incubation/llm-d-async/")) | "\(.Path | ltrimstr("github.com/llm-d-incubation/llm-d-async/")) \(.Version)"') \
+	    (cd "$$d" && go mod edit -json | jq -r '.Require[]? | select(.Path | startswith("github.com/llm-d/llm-d-async/")) | "\(.Path | ltrimstr("github.com/llm-d/llm-d-async/")) \(.Version)"') \
 	    | while read sub ver; do \
 	      printf "  %-20s %-12s %s\n" "$$d/go.mod" "$$sub" "$$ver"; \
 	    done; \
@@ -401,7 +401,7 @@ set-version:
 	done
 
 ## Copied from https://github.com/llm-d-incubation/batch-gateway
-## publish-helm-chart: Patch chart for VERSION, package, append chart to SHA256SUMS, push to oci://ghcr.io/llm-d-incubation/charts (requires VERSION, yq, helm; GITHUB_TOKEN, GITHUB_ACTOR for push).
+## publish-helm-chart: Patch chart for VERSION, package, append chart to SHA256SUMS, push to oci://ghcr.io/llm-d/charts (requires VERSION, yq, helm; GITHUB_TOKEN, GITHUB_ACTOR for push).
 .PHONY: publish-helm-chart
 publish-helm-chart:
 	@if [ -z "$(VERSION)" ]; then \
