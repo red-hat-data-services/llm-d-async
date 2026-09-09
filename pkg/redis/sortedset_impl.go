@@ -1271,7 +1271,7 @@ func (r *RedisSortedSetFlow) cleanupRequestStateByIDAndToken(ctx context.Context
 }
 
 func (r *RedisSortedSetFlow) marshalResult(msg api.ResultMessage) string {
-	if bytes, err := json.Marshal(msg); err == nil {
+	if bytes, err := marshalInternalResult(msg); err == nil {
 		return string(bytes)
 	}
 	fallback := map[string]string{"id": msg.ID, "payload": `{"error":"marshal failed"}`}

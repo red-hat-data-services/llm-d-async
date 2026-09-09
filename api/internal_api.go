@@ -79,6 +79,15 @@ type InternalRequest struct {
 	IngestionTime time.Time `json:"-"`
 }
 
+// InternalResult is the persisted result envelope used by infrastructure.
+// ResultMessage remains embedded so its existing top-level JSON fields stay
+// wire-compatible; RequestToken identifies the request generation for durable
+// delivery and duplicate suppression.
+type InternalResult struct {
+	ResultMessage
+	RequestToken string `json:"request_token,omitempty"`
+}
+
 // NewInternalRequest returns an InternalRequest with a non-nil PublicRequest.
 // routing fields may be zero; PublicRequest must be non-nil.
 func NewInternalRequest(routing InternalRouting, typedReq Request) *InternalRequest {

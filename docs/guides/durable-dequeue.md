@@ -4,6 +4,7 @@ Related:
 - [Bug #404: Accepted Redis requests can be lost when an Async pod is hard-killed](https://github.com/llm-d/llm-d-async/issues/404)
 - [batch-gateway #644: Async results can be lost with multiple Batch Processor replicas](https://github.com/llm-d/llm-d-batch-gateway/issues/644) (result-side counterpart)
 - [batch-gateway #645: Resume in-progress batches after Processor pod or node loss](https://github.com/llm-d/llm-d-batch-gateway/issues/645)
+- [Durable result delivery](durable-result-delivery.md) closes the separate result-consumer checkpoint window.
 
 ## The problem
 
