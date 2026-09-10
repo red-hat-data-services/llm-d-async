@@ -137,7 +137,7 @@ func TestMarshalResultMessage_StructuredFields(t *testing.T) {
 	}{
 		{
 			name: "HTTP success preserves status_code",
-			msg:  api.ResultMessage{ID: "http-ok", StatusCode: 200, Payload: `{"result":"ok"}`},
+			msg:  api.ResultMessage{ID: "http-ok", StatusCode: 200, Payload: `{"result":"ok"}`, Routing: api.InternalRouting{RequestToken: "http-ok-token"}},
 		},
 		{
 			name: "HTTP error preserves status_code and body",
@@ -155,10 +155,11 @@ func TestMarshalResultMessage_StructuredFields(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			serialized := marshalResultMessage(tt.msg)
-			var got api.ResultMessage
-			if err := json.Unmarshal([]byte(serialized), &got); err != nil {
+			var wire api.InternalResult
+			if err := json.Unmarshal([]byte(serialized), &wire); err != nil {
 				t.Fatalf("Failed to unmarshal: %v", err)
 			}
+			got := wire.ResultMessage
 			if got.ID != tt.msg.ID {
 				t.Errorf("ID = %q, want %q", got.ID, tt.msg.ID)
 			}
@@ -173,6 +174,9 @@ func TestMarshalResultMessage_StructuredFields(t *testing.T) {
 			}
 			if got.ErrorMessage != tt.msg.ErrorMessage {
 				t.Errorf("ErrorMessage = %q, want %q", got.ErrorMessage, tt.msg.ErrorMessage)
+			}
+			if wire.RequestToken != tt.msg.Routing.RequestToken {
+				t.Errorf("RequestToken = %q, want %q", wire.RequestToken, tt.msg.Routing.RequestToken)
 			}
 		})
 	}

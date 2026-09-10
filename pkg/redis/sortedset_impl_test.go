@@ -700,20 +700,22 @@ func TestSortedSetFlow_ResultStructuredFields(t *testing.T) {
 	flow := &RedisSortedSetFlow{
 		defaultResultQueueName: queue,
 		rdb:                    rdb,
-		resultChannel:          make(chan api.ResultMessage, 4),
+		resultChannel:          make(chan api.ResultMessage, 6),
 		pollInterval:           50 * time.Millisecond,
 		batchSize:              10,
 		gate:                   noopGate(),
 	}
 
 	messages := []api.ResultMessage{
-		{ID: "success", StatusCode: 201, Payload: `{"id":"new"}`},
-		{ID: "http-err", StatusCode: 502, Payload: `{"error":"bad gateway"}`},
-		{ID: "deadline", Payload: `{"error":"deadline exceeded"}`, ErrorCode: api.ErrCodeDeadlineExceeded, ErrorMessage: "deadline exceeded"},
-		{ID: "gate-drop", Payload: `{"error":"Pool gating dropped request"}`, ErrorCode: api.ErrCodeGateDropped, ErrorMessage: "Pool gating dropped request"},
+		api.NewHTTPResult(&api.RequestMessage{ID: "success"}, api.InternalRouting{RequestToken: "success-token"}, 201, []byte(`{"id":"new"}`)),
+		api.NewHTTPResult(&api.RequestMessage{ID: "http-err"}, api.InternalRouting{RequestToken: "http-err-token"}, 502, []byte(`{"error":"bad gateway"}`)),
+		api.NewErrorResult(&api.RequestMessage{ID: "non-http"}, api.InternalRouting{RequestToken: "non-http-token"}, api.ErrCodeInferenceError, "connection reset"),
+		api.NewDeadlineExceededResult(&api.RequestMessage{ID: "deadline"}, api.InternalRouting{RequestToken: "deadline-token"}),
+		api.NewCancelledResult(&api.RequestMessage{ID: "cancelled"}, api.InternalRouting{RequestToken: "cancelled-token"}),
+		api.NewGateDroppedResult(&api.RequestMessage{ID: "gate-drop"}, api.InternalRouting{RequestToken: "gate-drop-token"}),
 	}
 	for _, m := range messages {
-		registerTestClaim(ctx, flow, queue, m.ID, "")
+		registerTestClaim(ctx, flow, queue, m.ID, m.Routing.RequestToken)
 		flow.resultChannel <- m
 	}
 
@@ -737,8 +739,9 @@ func TestSortedSetFlow_ResultStructuredFields(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RPop error for %s: %v", want.ID, err)
 		}
-		var got api.ResultMessage
-		if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		var wire api.InternalResult
+		got := &wire.ResultMessage
+		if err := json.Unmarshal([]byte(raw), &wire); err != nil {
 			t.Fatalf("Unmarshal error for %s: %v", want.ID, err)
 		}
 		if got.ID != want.ID {
@@ -755,6 +758,9 @@ func TestSortedSetFlow_ResultStructuredFields(t *testing.T) {
 		}
 		if got.ErrorMessage != want.ErrorMessage {
 			t.Errorf("[%s] ErrorMessage = %q, want %q", want.ID, got.ErrorMessage, want.ErrorMessage)
+		}
+		if wire.RequestToken != want.Routing.RequestToken {
+			t.Errorf("[%s] RequestToken = %q, want %q", want.ID, wire.RequestToken, want.Routing.RequestToken)
 		}
 	}
 }
