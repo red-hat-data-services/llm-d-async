@@ -5,6 +5,60 @@ import (
 	"testing"
 )
 
+func TestInternalResultWireCompatibility(t *testing.T) {
+	wire := InternalResult{
+		ResultMessage: ResultMessage{
+			ID:           "result-1",
+			StatusCode:   503,
+			Payload:      `{"error":"unavailable"}`,
+			ErrorCode:    ErrCodeInferenceError,
+			ErrorMessage: "backend unavailable",
+			Routing:      InternalRouting{RequestQueueName: "must-not-leak"},
+			Metadata:     map[string]string{"must": "not leak"},
+		},
+		RequestToken: "generation-1",
+	}
+
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal InternalResult: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("unmarshal result fields: %v", err)
+	}
+	for _, field := range []string{"id", "status_code", "payload", "error_code", "error_message", "request_token"} {
+		if _, ok := fields[field]; !ok {
+			t.Errorf("missing top-level field %q in %s", field, data)
+		}
+	}
+	if _, ok := fields["routing"]; ok {
+		t.Errorf("routing leaked into result wire: %s", data)
+	}
+	if _, ok := fields["metadata"]; ok {
+		t.Errorf("metadata leaked into result wire: %s", data)
+	}
+
+	// A legacy consumer still sees the unchanged ResultMessage fields and
+	// safely ignores the additive request_token field.
+	var legacy ResultMessage
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		t.Fatalf("legacy unmarshal: %v", err)
+	}
+	if legacy.ID != wire.ID || legacy.StatusCode != wire.StatusCode || legacy.Payload != wire.Payload {
+		t.Fatalf("legacy result mismatch: got %#v want %#v", legacy, wire.ResultMessage)
+	}
+
+	// A new reader must also accept old records without generation metadata.
+	var oldRecord InternalResult
+	if err := json.Unmarshal([]byte(`{"id":"legacy","payload":"done"}`), &oldRecord); err != nil {
+		t.Fatalf("old record unmarshal: %v", err)
+	}
+	if oldRecord.ID != "legacy" || oldRecord.RequestToken != "" {
+		t.Fatalf("old record mismatch: %#v", oldRecord)
+	}
+}
+
 func TestRoundTrip_PlainRequestMessage(t *testing.T) {
 	ir := NewInternalRequest(
 		InternalRouting{RetryCount: 2, RequestQueueName: "rq", ResultQueueName: "resq", ResultTTLSeconds: 60, ResultRoutingResolved: true},

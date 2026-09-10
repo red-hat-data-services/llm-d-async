@@ -316,12 +316,20 @@ func (r *RedisMQFlow) flushResultBatch(ctx context.Context, batch []api.ResultMe
 }
 
 func marshalResultMessage(msg api.ResultMessage) string {
-	if bytes, err := json.Marshal(msg); err == nil {
+	if bytes, err := marshalInternalResult(msg); err == nil {
 		return string(bytes)
 	}
 	fallback := map[string]string{"id": msg.ID, "error": "Failed to marshal result to string"}
 	fallbackBytes, _ := json.Marshal(fallback)
 	return string(fallbackBytes)
+}
+
+func marshalInternalResult(msg api.ResultMessage) ([]byte, error) {
+	wire := api.InternalResult{
+		ResultMessage: msg,
+		RequestToken:  msg.Routing.RequestToken,
+	}
+	return json.Marshal(wire)
 }
 
 // pulls from Redis channel and put in the request channel.

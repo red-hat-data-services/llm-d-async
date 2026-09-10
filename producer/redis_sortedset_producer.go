@@ -13,15 +13,20 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var _ Producer = (*RedisSortedSetProducer)(nil)
+var (
+	_ Producer              = (*RedisSortedSetProducer)(nil)
+	_ DurableResultProducer = (*RedisSortedSetProducer)(nil)
+)
 
 // RedisSortedSetProducer implements Producer using Redis sorted set for requests
 // and Redis list for results.
 type RedisSortedSetProducer struct {
-	client           *redis.Client
-	managedClient    bool
-	requestQueueName string
-	resultQueueName  string
+	client                     *redis.Client
+	managedClient              bool
+	requestQueueName           string
+	resultQueueName            string
+	resultClaimLeaseTTL        time.Duration
+	resultClaimReclaimInterval time.Duration
 }
 
 const cancellationMarkerTTL = 7 * 24 * time.Hour
@@ -48,6 +53,30 @@ func WithRedisClient(client *redis.Client) ProducerOption {
 			return errors.New("WithRedisClient: client must not be nil")
 		}
 		p.client = client
+		return nil
+	}
+}
+
+// WithResultClaimLeaseTTL configures the crash-detection window for durable
+// result deliveries. The default is five minutes.
+func WithResultClaimLeaseTTL(ttl time.Duration) ProducerOption {
+	return func(p *RedisSortedSetProducer) error {
+		if ttl <= 0 {
+			return errors.New("WithResultClaimLeaseTTL: duration must be positive")
+		}
+		p.resultClaimLeaseTTL = ttl
+		return nil
+	}
+}
+
+// WithResultClaimReclaimInterval configures how often ReceiveResult checks for
+// pending results and expired claims. The default is one second.
+func WithResultClaimReclaimInterval(interval time.Duration) ProducerOption {
+	return func(p *RedisSortedSetProducer) error {
+		if interval <= 0 {
+			return errors.New("WithResultClaimReclaimInterval: duration must be positive")
+		}
+		p.resultClaimReclaimInterval = interval
 		return nil
 	}
 }
@@ -81,8 +110,10 @@ func NewRedisSortedSetProducer(config RedisSortedSetConfig, opts ...ProducerOpti
 	}
 
 	p := &RedisSortedSetProducer{
-		requestQueueName: config.RequestQueueName,
-		resultQueueName:  config.ResultQueueName,
+		requestQueueName:           config.RequestQueueName,
+		resultQueueName:            config.ResultQueueName,
+		resultClaimLeaseTTL:        defaultResultClaimLeaseTTL,
+		resultClaimReclaimInterval: defaultResultClaimReclaimInterval,
 	}
 
 	for _, opt := range opts {
@@ -277,16 +308,7 @@ func (p *RedisSortedSetProducer) GetResult(ctx context.Context) (*api.ResultMess
 
 // parseResult parses a JSON result message.
 func (p *RedisSortedSetProducer) parseResult(data string) (*api.ResultMessage, error) {
-	var result api.ResultMessage
-	if err := json.Unmarshal([]byte(data), &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal result: %w", err)
-	}
-
-	if result.ID == "" {
-		return nil, errors.New("result missing 'id' field")
-	}
-
-	return &result, nil
+	return parseInternalResult(data)
 }
 
 // Close closes the Redis connection if the client was created internally.
@@ -315,5 +337,6 @@ func (p *RedisSortedSetProducer) ClearRequestQueue(ctx context.Context) error {
 
 // ClearResultQueue removes all results from the queue.
 func (p *RedisSortedSetProducer) ClearResultQueue(ctx context.Context) error {
-	return p.client.Del(ctx, p.resultQueueName).Err()
+	keys := newResultClaimKeys(p.resultQueueName)
+	return p.client.Del(ctx, keys.pending, keys.claimed, keys.owners, keys.idx, keys.tombstones).Err()
 }
