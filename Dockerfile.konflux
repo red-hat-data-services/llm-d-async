@@ -27,11 +27,11 @@ COPY internal/ internal
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -a -ldflags "${LDFLAGS}" -o async-processor cmd/main.go
+RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -a -ldflags "${LDFLAGS}" -o llm-d-async cmd/main.go
 
 FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:b3a0b012de0c578082e1bc5b01c8bc27461b4eeb571a0b1a2b21a07dbd845a62
 WORKDIR /
-COPY --from=builder /opt/app-root/src/async-processor .
+COPY --from=builder /opt/app-root/src/llm-d-async .
 USER 1001:1001
 
-ENTRYPOINT ["/async-processor"]
+ENTRYPOINT ["/llm-d-async"]
